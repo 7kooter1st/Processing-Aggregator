@@ -1,0 +1,516 @@
+openapi: 3.0.3
+info:
+  title: Processing Service API
+  description: |
+    **Processing Service** (Consumer → Ollama Orchestrator + Aggregator).
+
+    Сервис читает чанки из Kafka (`raw_chunks`), отправляет промпты в локальную LLM (Ollama),
+    публикует промежуточные результаты в `processed_results`, статусы в `status_updates`,
+    агрегирует финальный JSON сравнения и доставляет его на фронтенд через WebSocket.
+
+    **Пайплайн (в связке с Chunking & Producer):**
+    1. Фронтенд → `POST /api/compare` на Chunking Service (`:5000`) — загрузка файлов, `job_id`
+    2. Chunking → Kafka `raw_chunks`
+    3. **Processing Service** (`:5001`) — Ollama, `processed_results`, `status_updates`
+    4. Фронтенд → WebSocket `ws://localhost:5001/ws/jobs/{job_id}` — прогресс и результат
+    5. (fallback) `GET /api/jobs/{job_id}/result` — получить результат без WebSocket
+
+    **Swagger UI:** `http://localhost:5001/docs`
+
+    **WebSocket** не отображается в стандартном Swagger UI; контракт описан в разделе
+    `x-websocket` и в схеме `WebSocketEvent`.
+  version: 1.1.0
+  contact:
+    name: Processing Service
+
+servers:
+  - url: http://localhost:5001
+    description: Локальный Processing Service
+
+tags:
+  - name: Health
+    description: Проверка доступности сервиса, Kafka и Ollama
+  - name: Jobs
+    description: Статус задач и финальный результат сравнения
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Проверка состояния сервиса
+      description: |
+        Возвращает общий статус и доступность Kafka (consumer + producer + aggregator relay)
+        и Ollama API.
+      operationId: health
+      responses:
+        "200":
+          description: Сервис отвечает
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  summary: Всё доступно
+                  value:
+                    status: ok
+                    kafka_connected: true
+                    ollama_reachable: true
+                degraded:
+                  summary: Частичная недоступность
+                  value:
+                    status: degraded
+                    kafka_connected: false
+                    ollama_reachable: true
+
+  /api/jobs:
+    get:
+      tags: [Jobs]
+      summary: Список активных задач
+      description: |
+        Возвращает задачи, зарегистрированные в памяти Consumer при обработке `raw_chunks`.
+        Список сбрасывается при перезапуске сервиса.
+      operationId: listJobs
+      responses:
+        "200":
+          description: Список задач
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JobStatusResponse"
+              example:
+                - job_id: "550e8400-e29b-41d4-a716-446655440000"
+                  document_id: "550e8400-e29b-41d4-a716-446655440000"
+                  status: processing
+                  processed_chunks: 3
+                  total_chunks: 10
+                  message: "Анализ chunk 3/10..."
+
+  /api/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Статус задачи по job_id
+      description: |
+        Возвращает прогресс обработки чанков Ollama (не путать с финальным результатом сравнения).
+        Для live-обновлений предпочтительнее WebSocket.
+      operationId: getJob
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Статус задачи
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
+              example:
+                job_id: "550e8400-e29b-41d4-a716-446655440000"
+                document_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: processing
+                processed_chunks: 7
+                total_chunks: 10
+                message: "Анализ chunk 7/10..."
+        "404":
+          description: Задача не найдена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "Job 550e8400-e29b-41d4-a716-446655440000 not found"
+
+  /api/jobs/{job_id}/result:
+    get:
+      tags: [Jobs]
+      summary: Финальный результат сравнения (REST fallback)
+      description: |
+        Возвращает агрегированный результат после обработки всех чанков.
+        Доступен только когда Aggregator собрал все `processed_results`.
+
+        Рекомендуемый способ получения результата — WebSocket (`type: result`).
+        Этот endpoint — fallback при обрыве WebSocket или для polling.
+      operationId: getJobResult
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Результат сравнения готов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultResponse"
+              examples:
+                withDifferences:
+                  summary: Есть расхождения
+                  value:
+                    comparison:
+                      identical: false
+                      differences:
+                        - line_number: 5
+                          file1_line: "Сумма: 100 000 руб."
+                          file2_line: "Сумма: 120 000 руб."
+                        - line_number: 12
+                          file1_line: "Срок: 30 дней"
+                          file2_line: "Срок: 45 дней"
+                identical:
+                  summary: Документы идентичны
+                  value:
+                    comparison:
+                      identical: true
+                      differences: []
+        "404":
+          description: Результат ещё не готов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "Result for job 550e8400-e29b-41d4-a716-446655440000 is not ready yet"
+
+x-websocket:
+  /ws/jobs/{job_id}:
+    summary: Live-прогресс и финальный результат
+    description: |
+      Подключение фронтенда к задаче сравнения.
+
+      **URL:** `ws://localhost:5001/ws/jobs/{job_id}`
+
+      **Когда подключаться:** сразу после получения `job_id` от Chunking Service
+      (`POST /api/compare` на порту 5000).
+
+      **Поведение сервера:**
+      - При подключении, если результат уже готов, сразу отправляется событие `result`
+      - В процессе обработки приходят события `status` из Kafka topic `status_updates`
+      - По завершении агрегации приходит событие `result` с финальным JSON
+      - Клиент может отправлять любой текст (ping) для поддержания соединения
+
+      **Типы событий (входящие сообщения):** `status`, `result`, `error`
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: ID задачи из ответа Chunking Service
+    messages:
+      status:
+        summary: Обновление прогресса
+        payload:
+          $ref: "#/components/schemas/WebSocketStatusEvent"
+      result:
+        summary: Финальный результат сравнения
+        payload:
+          $ref: "#/components/schemas/WebSocketResultEvent"
+      error:
+        summary: Ошибка обработки
+        payload:
+          $ref: "#/components/schemas/WebSocketErrorEvent"
+
+x-kafka:
+  description: |
+    Внутренние Kafka-топики Processing Service (для интеграции с Chunking & Producer).
+    HTTP API для этих топиков нет — только документация контракта.
+  consumes:
+    - topic: raw_chunks
+      description: Входящие чанки от Chunking & Producer
+      schema:
+        $ref: "#/components/schemas/RawChunkMessage"
+      key: job_id
+  produces:
+    - topic: processed_results
+      description: Промежуточные результаты Ollama по каждому чанку
+      schema:
+        $ref: "#/components/schemas/ProcessedResultMessage"
+      key: job_id
+    - topic: status_updates
+      description: Статусы для фронтенда (ретранслируются в WebSocket)
+      schema:
+        $ref: "#/components/schemas/StatusUpdateMessage"
+      key: job_id
+    - topic: raw_chunks_dlt
+      description: Dead Letter Topic — сообщения с ошибками валидации/обработки
+      key: job_id
+
+components:
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: UUID задачи сравнения (из Chunking Service)
+      schema:
+        type: string
+        format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, kafka_connected, ollama_reachable]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          description: |
+            `ok` — Kafka и Ollama доступны;
+            `degraded` — хотя бы один компонент недоступен
+        kafka_connected:
+          type: boolean
+          description: Producer, raw_chunks consumer и aggregator relay подключены
+        ollama_reachable:
+          type: boolean
+          description: Ollama API отвечает на GET /api/tags
+
+    JobStatusResponse:
+      type: object
+      required:
+        - job_id
+        - document_id
+        - status
+        - processed_chunks
+        - total_chunks
+        - message
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          description: ID документа (обычно совпадает с job_id)
+        status:
+          type: string
+          enum: [processing, completed, failed]
+          description: |
+            `processing` — идёт обработка чанков или сборка результата;
+            `completed` — все чанки обработаны (финальный статус от Aggregator — через WS);
+            `failed` — ошибка при обработке чанка
+        processed_chunks:
+          type: integer
+          minimum: 0
+          description: Число обработанных чанков
+        total_chunks:
+          type: integer
+          minimum: 1
+          description: Общее число чанков в задаче
+        message:
+          type: string
+          description: Человекочитаемое сообщение о текущем шаге
+          example: "Анализ chunk 3/10..."
+
+    LineDifference:
+      type: object
+      properties:
+        line_number:
+          type: integer
+          nullable: true
+          description: Номер строки (нумерация с 1)
+        file1_line:
+          type: string
+          nullable: true
+          description: Строка из первого документа
+        file2_line:
+          type: string
+          nullable: true
+          description: Строка из второго документа
+
+    ComparisonResult:
+      type: object
+      required: [identical, differences]
+      properties:
+        identical:
+          type: boolean
+          description: true — все строки совпадают
+        differences:
+          type: array
+          items:
+            $ref: "#/components/schemas/LineDifference"
+
+    ResultResponse:
+      type: object
+      required: [comparison]
+      properties:
+        comparison:
+          $ref: "#/components/schemas/ComparisonResult"
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+          description: Описание ошибки (формат FastAPI HTTPException)
+
+    WebSocketEvent:
+      type: object
+      required: [type, job_id, data]
+      properties:
+        type:
+          type: string
+          enum: [status, result, error]
+        job_id:
+          type: string
+          format: uuid
+        data:
+          type: object
+          description: Полезная нагрузка (зависит от type)
+
+    WebSocketStatusEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebSocketEvent"
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [status]
+            data:
+              $ref: "#/components/schemas/StatusUpdateMessage"
+
+    WebSocketResultEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebSocketEvent"
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [result]
+            data:
+              type: object
+              required: [comparison]
+              properties:
+                comparison:
+                  $ref: "#/components/schemas/ComparisonResult"
+
+    WebSocketErrorEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebSocketEvent"
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [error]
+            data:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                details:
+                  type: object
+                  additionalProperties: true
+
+    StatusUpdateMessage:
+      type: object
+      description: Payload в Kafka topic status_updates и в WebSocket type=status
+      required:
+        - job_id
+        - document_id
+        - status
+        - processed_chunks
+        - total_chunks
+        - message
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        processed_chunks:
+          type: integer
+          minimum: 0
+        total_chunks:
+          type: integer
+          minimum: 1
+        message:
+          type: string
+          example: "Анализ chunk 5/10..."
+        updated_at:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC
+
+    RawChunkMessage:
+      type: object
+      description: Входящее сообщение из Kafka topic raw_chunks (от Chunking Service)
+      required: [job_id, document_id, chunk_index, total_chunks]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Ключ сообщения Kafka
+        document_id:
+          type: string
+        chunk_index:
+          type: integer
+          minimum: 1
+          description: Номер чанка (1..total_chunks)
+        total_chunks:
+          type: integer
+          minimum: 1
+          description: Одинаковое значение во всех сообщениях задачи
+        file1:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ChunkContent"
+        file2:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ChunkContent"
+
+    ChunkContent:
+      type: object
+      required: [filename, format, content_type, content]
+      properties:
+        filename:
+          type: string
+        format:
+          type: string
+          enum: [pdf, docx]
+        content_type:
+          type: string
+          enum: [text, image]
+          description: text — для DOCX; image — base64 PNG для PDF-страниц
+        content:
+          type: string
+          description: Текст чанка или base64-encoded PNG
+
+    ProcessedResultMessage:
+      type: object
+      description: Исходящее сообщение в Kafka topic processed_results
+      required: [job_id, document_id, chunk_index, total_chunks, ollama]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+        chunk_index:
+          type: integer
+        total_chunks:
+          type: integer
+        ollama:
+          type: object
+          description: Полный ответ Ollama API (/api/chat)
+          properties:
+            message:
+              type: object
+              properties:
+                role:
+                  type: string
+                  example: assistant
+                content:
+                  type: string
+                  description: JSON-строка с comparison_fragment
+        comparison_fragment:
+          type: object
+          nullable: true
+          description: Распарсенный JSON из ответа модели
+          allOf:
+            - $ref: "#/components/schemas/ComparisonResult"
+        processed_at:
+          type: string
+          format: date-time
