@@ -12,7 +12,7 @@
 | **Chunking & Producer** | `5000` | Приём PDF/DOCX, разбиение на чанки, публикация в Kafka |
 | **Processing Service** | `5001` | Ollama, агрегация, WebSocket для фронтенда |
 | **Kafka** | `9092` | Очередь сообщений между сервисами |
-| **Ollama** | `11434` | Локальная LLM (модель `gemma4`) |
+| **Ollama** | `11435` | Локальная LLM (модель `gemma4`) / FakeOllama |
 
 Фронтенд общается с **двумя** бэкендами:
 - `http://localhost:5000` — только загрузка (`POST /api/compare`)
@@ -148,7 +148,7 @@ Processing Service подписан на `raw_chunks` и для **каждого
 ### 3.2 Вызывает Ollama
 
 ```
-POST http://localhost:11434/api/chat
+POST http://localhost:11435/api/chat
 { "model": "gemma4", "messages": [...], "format": "json" }
 ```
 

@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
                 settings.kafka_topic_status_updates)
     logger.info("Ollama: %s model=%s", settings.ollama_base_url, settings.ollama_model)
     logger.info("WebSocket: ws://localhost:%s/ws/jobs/{job_id}", settings.app_port)
+    logger.info("WebSocketHub id=%s Aggregator id=%s", id(ws_hub), id(aggregator))
     logger.info("=" * 60)
     await publisher.start()
     await consumer_worker.start()
@@ -139,8 +140,12 @@ async def get_job_result(job_id: str) -> ResultResponse:
 if __name__ == "__main__":
     import uvicorn
 
+    # Pass the app object (not "main:app") to avoid double-importing this module.
+    # String import creates a second set of singletons (ws_hub / aggregator), so
+    # WebSocket clients register on one hub while Kafka relays broadcast on another
+    # → "[WS] no clients" while Comparator thinks upstream is connected.
     uvicorn.run(
-        "main:app",
+        app,
         host=settings.app_host,
         port=settings.app_port,
         reload=False,

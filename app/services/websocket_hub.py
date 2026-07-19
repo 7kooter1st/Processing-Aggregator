@@ -23,7 +23,12 @@ class WebSocketHub:
         async with self._lock:
             self._connections.setdefault(job_id, set()).add(websocket)
             clients_count = len(self._connections[job_id])
-        logger.info("[WS] connected job=%s (clients: %s)", job_id, clients_count)
+        logger.info(
+            "[WS] connected job=%s (clients: %s, hub_id=%s)",
+            job_id,
+            clients_count,
+            id(self),
+        )
 
     async def disconnect(self, job_id: str, websocket: WebSocket) -> None:
         async with self._lock:
@@ -41,18 +46,22 @@ class WebSocketHub:
 
         if not clients:
             logger.warning(
-                "[WS] no clients for job=%s — event type=%s not delivered (frontend not connected?)",
+                "[WS] no clients for job=%s — event type=%s not delivered "
+                "(frontend not connected? hub_id=%s tracked_jobs=%s)",
                 job_id,
                 event.type,
+                id(self),
+                list(self._connections.keys()),
             )
             return
 
         payload = event.model_dump()
         logger.info(
-            "[WS] send job=%s type=%s clients=%s payload=%s",
+            "[WS] send job=%s type=%s clients=%s hub_id=%s payload=%s",
             job_id,
             event.type,
             len(clients),
+            id(self),
             summarize_for_log(payload),
         )
         dead: list[WebSocket] = []

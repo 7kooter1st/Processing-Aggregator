@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     kafka_topic_status_updates: str = "status_updates"
     kafka_topic_dlt: str = "raw_chunks_dlt"
 
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://localhost:11435"
     ollama_model: str = "gemma4"
     ollama_timeout_seconds: float = 300.0
 
