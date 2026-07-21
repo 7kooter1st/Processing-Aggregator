@@ -310,11 +310,35 @@ components:
         file1_line:
           type: string
           nullable: true
-          description: Строка из первого документа
+          maxLength: 200
+          description: Фрагмент строки из первого документа (макс. 200 символов)
         file2_line:
           type: string
           nullable: true
-          description: Строка из второго документа
+          maxLength: 200
+          description: Фрагмент строки из второго документа (макс. 200 символов)
+        file1_span:
+          type: array
+          nullable: true
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+          description: |
+            [start, end] — индексы символов внутри file1_line (0-based, start включительно, end исключительно).
+            Для подсветки на фронте: file1_line.slice(start, end)
+          example: [12, 28]
+        file2_span:
+          type: array
+          nullable: true
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+          description: |
+            [start, end] — индексы символов внутри file2_line (0-based, start включительно, end исключительно).
+            Для подсветки на фронте: file2_line.slice(start, end)
+          example: [12, 30]
 
     ComparisonResult:
       type: object

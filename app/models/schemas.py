@@ -85,6 +85,8 @@ class LineDifference(BaseModel):
     line_number: int | None = None
     file1_line: str | None = None
     file2_line: str | None = None
+    file1_span: list[int] | None = None
+    file2_span: list[int] | None = None
 
 
 class ComparisonResult(BaseModel):
