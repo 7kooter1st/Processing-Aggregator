@@ -13,6 +13,8 @@ class OllamaClient:
         self._base_url = settings.ollama_base_url.rstrip("/")
         self._model = settings.ollama_model
         self._timeout = settings.ollama_timeout_seconds
+        self._temperature = settings.ollama_temperature
+        self._think = settings.ollama_think
 
     async def is_available(self) -> bool:
         try:
@@ -28,12 +30,18 @@ class OllamaClient:
             "messages": messages,
             "stream": False,
             "format": "json",
+            "think": self._think,
+            "options": {
+                "temperature": self._temperature,
+            },
         }
 
         logger.info(
-            "[OLLAMA] request job chunk model=%s messages=%s",
+            "[OLLAMA] request job chunk model=%s messages=%s temperature=%s think=%s",
             self._model,
             len(messages),
+            self._temperature,
+            self._think,
         )
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:

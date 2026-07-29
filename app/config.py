@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "gemma4"
     ollama_timeout_seconds: float = 300.0
+    ollama_temperature: float = 0.1
+    ollama_think: bool = False
 
     consumer_max_concurrent: int = 3
     kafka_consumer_group_aggregator: str = "processing-service-aggregator"
