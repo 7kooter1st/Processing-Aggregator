@@ -5,7 +5,7 @@ from typing import Any
 from aiokafka import AIOKafkaProducer
 
 from app.config import settings
-from app.logging_utils import summarize_for_log
+from app.logging_utils import summarize_for_log, strip_payload_for_dlt
 from app.models.schemas import ProcessedResultMessage, StatusUpdateMessage
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ class KafkaPublisher:
             bootstrap_servers=settings.kafka_bootstrap_servers,
             value_serializer=lambda value: json.dumps(value).encode("utf-8"),
             key_serializer=lambda key: key.encode("utf-8") if key else None,
+            max_request_size=settings.kafka_max_request_size_bytes,
         )
         await self._producer.start()
         logger.info("Kafka producer connected to %s", settings.kafka_bootstrap_servers)
@@ -48,10 +49,12 @@ class KafkaPublisher:
         )
 
     async def publish_to_dlt(self, payload: dict[str, Any], error: str) -> None:
+        # Never push full page images into DLT — that floods logs and can exceed Kafka limits.
+        safe_payload = strip_payload_for_dlt(payload)
         await self._send(
             topic=settings.kafka_topic_dlt,
             key=payload.get("job_id"),
-            value={"original": payload, "error": error},
+            value={"original": safe_payload, "error": error[:500]},
         )
 
     async def _send(

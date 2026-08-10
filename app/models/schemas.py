@@ -81,6 +81,16 @@ class JobStatusResponse(BaseModel):
     message: str
 
 
+class JobRegisterRequest(BaseModel):
+    """Early registration from Chunking before the first Kafka chunk arrives."""
+
+    job_id: str
+    document_id: str | None = None
+    total_chunks: int = 0
+    status: str = "queued"
+    message: str = "Ожидание чанков из Kafka..."
+
+
 class LineDifference(BaseModel):
     line_number: int | None = None
     file1_line: str | None = None

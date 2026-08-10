@@ -8,7 +8,12 @@ from app.config import settings
 from app.kafka.consumer import KafkaConsumerWorker
 from app.kafka.producer import KafkaPublisher
 from app.kafka.relay_consumer import AggregatorConsumers
-from app.models.schemas import HealthResponse, JobStatusResponse, ResultResponse
+from app.models.schemas import (
+    HealthResponse,
+    JobRegisterRequest,
+    JobStatusResponse,
+    ResultResponse,
+)
 from app.services.chunk_processor import ChunkProcessor
 from app.services.ollama_client import OllamaClient
 from app.services.result_aggregator import ResultAggregator
@@ -51,6 +56,14 @@ async def lifespan(app: FastAPI):
     logger.info("Ollama: %s model=%s", settings.ollama_base_url, settings.ollama_model)
     logger.info("WebSocket: ws://localhost:%s/ws/jobs/{job_id}", settings.app_port)
     logger.info("=" * 60)
+
+    ollama_ready = await ollama_client.wait_until_available()
+    if not ollama_ready:
+        raise RuntimeError(
+            f"Ollama is not reachable at {settings.ollama_base_url}. "
+            "Start Ollama (start-all.bat or ollama serve) and retry."
+        )
+
     await publisher.start()
     await consumer_worker.start()
     await relay_consumers.start()
@@ -107,6 +120,26 @@ async def list_jobs() -> list[JobStatusResponse]:
         )
         for job in jobs
     ]
+
+
+@app.post("/api/jobs", response_model=JobStatusResponse, tags=["Jobs"])
+async def register_job(body: JobRegisterRequest) -> JobStatusResponse:
+    """Register a job early so Chunking polling does not see 404 before Kafka."""
+    job = await state_manager.ensure_job(
+        job_id=body.job_id,
+        document_id=body.document_id or body.job_id,
+        total_chunks=body.total_chunks,
+        status=body.status,
+        message=body.message,
+    )
+    return JobStatusResponse(
+        job_id=job.job_id,
+        document_id=job.document_id,
+        status=job.status,
+        processed_chunks=len(job.processed_chunks),
+        total_chunks=job.total_chunks,
+        message=job.last_message,
+    )
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])

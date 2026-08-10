@@ -42,7 +42,11 @@ sequenceDiagram
         P->>K: status_updates (processing)
         K->>P: status_updates (relay)
         P-->>F: WS type=status
-        P->>O: POST /api/chat
+        opt content_type=image
+            P->>O: OCR (chat, plain text)
+            O-->>P: распознанный текст
+        end
+        P->>O: Compare (chat, format=json)
         O-->>P: JSON сравнения
         P->>K: processed_results
         P->>K: status_updates (chunk done)
@@ -128,28 +132,41 @@ Chunking **не** отправляет данные на фронтенд пос
 
 ## Этап 3. Processing Service — обработка чанка (Consumer → Ollama)
 
-Processing Service подписан на `raw_chunks` и для **каждого** сообщения:
+Processing Service подписан на `raw_chunks` и для **каждого** сообщения работает в **два шага**: OCR (если есть image) → Compare (всегда text↔text).
 
-### 3.1 Публикует статус «начали чанк»
+### 3.1 Публикует статус
 
 → Kafka topic **`status_updates`**:
+
+Если в чанке есть `content_type=image`:
 ```json
 {
-  "job_id": "cba6e23b-a3fd-45e1-a0bf-ee09a1e91aec",
-  "document_id": "cba6e23b-a3fd-45e1-a0bf-ee09a1e91aec",
   "status": "processing",
-  "processed_chunks": 2,
-  "total_chunks": 40,
-  "message": "Анализ chunk 3/40...",
-  "updated_at": "2026-07-01T15:49:00+00:00"
+  "message": "Распознавание chunk 3/40..."
 }
 ```
 
-### 3.2 Вызывает Ollama
+Затем (или сразу, если оба файла уже text):
+```json
+{
+  "status": "processing",
+  "message": "Сравнение chunk 3/40..."
+}
+```
 
+### 3.2 Вызывает Ollama (два промпта)
+
+**OCR** (только для `content_type=image`, без `format: json`):
 ```
 POST http://localhost:11434/api/chat
-{ "model": "gemma4", "messages": [...], "format": "json" }
+{ "model": "gemma4", "messages": [OCR system + image], "stream": false }
+```
+Пустой OCR-текст → ошибка чанка (не публикуется «успешный» compare).
+
+**Compare** (оба фрагмента уже text, с `format: json`):
+```
+POST http://localhost:11434/api/chat
+{ "model": "gemma4", "messages": [Compare system + texts], "format": "json" }
 ```
 
 ### 3.3 Публикует результат чанка
@@ -211,7 +228,7 @@ StatusRelay получает каждое сообщение из `status_update
     "status": "processing",
     "processed_chunks": 3,
     "total_chunks": 40,
-    "message": "Анализ chunk 6/40...",
+    "message": "Сравнение chunk 6/40...",
     "updated_at": "2026-07-01T15:49:32+00:00"
   }
 }
@@ -409,7 +426,8 @@ failed          ← чанк ушёл в DLT, WS type=status с status=failed
 | Лог | Значение |
 |-----|----------|
 | `[KAFKA IN] topic=raw_chunks` | Чанк получен от Chunking |
-| `[OLLAMA] response status=200` | Ollama ответила успешно |
+| `[OLLAMA] OCR response status=200` | OCR-фаза завершена |
+| `[OLLAMA] COMPARE response status=200` | Compare-фаза завершена |
 | `[KAFKA OUT] topic=status_updates` | Статус опубликован |
 | `[STATUS RELAY] progress=3/40` | Relay готов переслать на WS |
 | `[WS] no clients for job=...` | **Фронт не подключён — UI ничего не увидит** |

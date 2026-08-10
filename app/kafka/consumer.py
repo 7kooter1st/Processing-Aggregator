@@ -109,7 +109,8 @@ class KafkaConsumerWorker:
                 await self._publisher.publish_to_dlt(payload, str(exc))
                 await self._processor.handle_error(payload, f"Validation error: {exc}")
             except Exception as exc:
-                logger.exception(
+                # Do not log full exception with request bodies; keep message short.
+                logger.error(
                     "[PROCESS] failed job=%s chunk=%s: %s",
                     job_id,
                     chunk_index,
