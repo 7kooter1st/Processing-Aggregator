@@ -8,6 +8,7 @@ from app.models.schemas import (
     ResultResponse,
     StatusUpdateMessage,
 )
+from app.services.ocr_store import OcrStore
 from app.services.websocket_hub import WebSocketHub
 
 logger = logging.getLogger(__name__)
@@ -25,23 +26,51 @@ class _JobAggregation:
 class ResultAggregator:
     """Collects processed_results and builds final comparison for the frontend."""
 
-    def __init__(self, ws_hub: WebSocketHub, publish_status) -> None:
+    def __init__(
+        self,
+        ws_hub: WebSocketHub,
+        publish_status,
+        store: OcrStore,
+    ) -> None:
         self._ws_hub = ws_hub
         self._publish_status = publish_status
+        self._store = store
         self._jobs: dict[str, _JobAggregation] = {}
         self._final_results: dict[str, ResultResponse] = {}
         self._lock = asyncio.Lock()
 
     async def get_result(self, job_id: str) -> ResultResponse | None:
         async with self._lock:
-            return self._final_results.get(job_id)
+            cached = self._final_results.get(job_id)
+        if cached is not None:
+            return cached
+
+        persisted = await self._store.get_comparison_result(job_id)
+        if persisted is None:
+            return None
+        result = ResultResponse(
+            comparison=ComparisonResult.model_validate(persisted)
+        )
+        async with self._lock:
+            self._final_results.setdefault(job_id, result)
+            return self._final_results[job_id]
 
     async def handle_processed_result(self, message: ProcessedResultMessage) -> None:
+        cached: ResultResponse | None
         async with self._lock:
-            if message.job_id in self._final_results:
-                logger.info("[AGGREGATOR] skip job=%s — result already finalized", message.job_id)
-                return
+            cached = self._final_results.get(message.job_id)
+        if cached is not None:
+            logger.info(
+                "[AGGREGATOR] replay persisted/cached result job=%s",
+                message.job_id,
+            )
+            await self._ws_hub.send_result(
+                message.job_id,
+                cached.comparison,
+            )
+            return
 
+        async with self._lock:
             job = self._jobs.get(message.job_id)
             if job is None:
                 job = _JobAggregation(
@@ -59,11 +88,14 @@ class ResultAggregator:
                 )
                 return
 
+            if message.comparison_fragment is None:
+                raise ValueError(
+                    "processed_results has no comparison_fragment; "
+                    "refusing to mark the job identical"
+                )
+
             job.received_chunks.add(message.chunk_index)
-            job.fragments[message.chunk_index] = message.comparison_fragment or {
-                "identical": True,
-                "differences": [],
-            }
+            job.fragments[message.chunk_index] = message.comparison_fragment
 
             received = len(job.received_chunks)
             logger.info(
@@ -114,19 +146,35 @@ class ResultAggregator:
     def _merge_fragments(fragments: dict[int, dict], total_chunks: int) -> ComparisonResult:
         all_differences: list[LineDifference] = []
         all_identical = True
+        verdicts: set[str] = set()
 
         for index in sorted(fragments.keys()):
             fragment = fragments[index]
             if not fragment.get("identical", False):
                 all_identical = False
+            verdicts.add(fragment.get("verdict", "different"))
 
             for diff in fragment.get("differences") or []:
                 all_differences.append(LineDifference.model_validate(diff))
 
         if all_identical and not all_differences:
-            return ComparisonResult(identical=True, differences=[])
+            return ComparisonResult(
+                identical=True,
+                verdict="identical",
+                differences=[],
+            )
 
         if len(fragments) < total_chunks:
             all_identical = False
 
-        return ComparisonResult(identical=False, differences=all_differences)
+        if "different" in verdicts:
+            verdict = "different"
+        elif "content_equal" in verdicts:
+            verdict = "content_equal"
+        else:
+            verdict = "different"
+        return ComparisonResult(
+            identical=False,
+            verdict=verdict,
+            differences=all_differences,
+        )

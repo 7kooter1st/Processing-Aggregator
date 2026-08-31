@@ -4,14 +4,15 @@ info:
   description: |
     **Processing Service** (Consumer → Ollama Orchestrator + Aggregator).
 
-    Сервис читает чанки из Kafka (`raw_chunks`), отправляет промпты в локальную LLM (Ollama),
-    публикует промежуточные результаты в `processed_results`, статусы в `status_updates`,
-    агрегирует финальный JSON сравнения и доставляет его на фронтенд через WebSocket.
+    Сервис читает страницы из Kafka (`raw_chunks`), сохраняет распознанный текст в
+    PostgreSQL, выполняет детерминированный иерархический diff полных документов,
+    передаёт найденные области в локальную LLM только для строгой проверки и
+    доставляет финальный JSON на фронтенд через WebSocket.
 
     **Пайплайн (в связке с Chunking & Producer):**
     1. Фронтенд → `POST /api/compare` на Chunking Service (`:5000`) — загрузка файлов, `job_id`
     2. Chunking → Kafka `raw_chunks`
-    3. **Processing Service** (`:5001`) — Ollama, `processed_results`, `status_updates`
+    3. **Processing Service** (`:5001`) — OCR → PostgreSQL → hierarchical diff → LLM verify
     4. Фронтенд → WebSocket `ws://localhost:5001/ws/jobs/{job_id}` — прогресс и результат
     5. (fallback) `GET /api/jobs/{job_id}/result` — получить результат без WebSocket
 
@@ -19,7 +20,7 @@ info:
 
     **WebSocket** не отображается в стандартном Swagger UI; контракт описан в разделе
     `x-websocket` и в схеме `WebSocketEvent`.
-  version: 1.1.0
+  version: 2.0.0
   contact:
     name: Processing Service
 
@@ -29,7 +30,7 @@ servers:
 
 tags:
   - name: Health
-    description: Проверка доступности сервиса, Kafka и Ollama
+    description: Проверка доступности сервиса, Kafka, PostgreSQL и Ollama
   - name: Jobs
     description: Статус задач и финальный результат сравнения
 
@@ -39,8 +40,8 @@ paths:
       tags: [Health]
       summary: Проверка состояния сервиса
       description: |
-        Возвращает общий статус и доступность Kafka (consumer + producer + aggregator relay)
-        и Ollama API.
+        Возвращает общий статус и доступность Kafka (consumer + producer + aggregator relay),
+        PostgreSQL и Ollama API.
       operationId: health
       responses:
         "200":
@@ -56,20 +57,21 @@ paths:
                     status: ok
                     kafka_connected: true
                     ollama_reachable: true
+                    postgres_connected: true
                 degraded:
                   summary: Частичная недоступность
                   value:
                     status: degraded
                     kafka_connected: false
                     ollama_reachable: true
+                    postgres_connected: true
 
   /api/jobs:
     get:
       tags: [Jobs]
       summary: Список активных задач
       description: |
-        Возвращает задачи, зарегистрированные в памяти Consumer при обработке `raw_chunks`.
-        Список сбрасывается при перезапуске сервиса.
+        Возвращает задачи из PostgreSQL. Список сохраняется при перезапуске сервиса.
       operationId: listJobs
       responses:
         "200":
@@ -87,13 +89,30 @@ paths:
                   processed_chunks: 3
                   total_chunks: 10
                   message: "Анализ chunk 3/10..."
+    post:
+      tags: [Jobs]
+      summary: Ранняя регистрация задачи
+      operationId: registerJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobRegisterRequest"
+      responses:
+        "200":
+          description: Задача зарегистрирована в PostgreSQL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
 
   /api/jobs/{job_id}:
     get:
       tags: [Jobs]
       summary: Статус задачи по job_id
       description: |
-        Возвращает прогресс обработки чанков Ollama (не путать с финальным результатом сравнения).
+        Возвращает сохранённый в PostgreSQL прогресс OCR и этап сравнения.
         Для live-обновлений предпочтительнее WebSocket.
       operationId: getJob
       parameters:
@@ -121,13 +140,45 @@ paths:
               example:
                 detail: "Job 550e8400-e29b-41d4-a716-446655440000 not found"
 
+  /api/jobs/{job_id}/ocr:
+    get:
+      tags: [Jobs]
+      summary: Просмотр сохранённого OCR
+      description: |
+        Возвращает точный текст всех страниц/чанков, сохранённый в PostgreSQL
+        до запуска иерархического diff. Параметр `side` ограничивает ответ
+        первым или вторым документом.
+      operationId: getJobOcr
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: side
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2
+      responses:
+        "200":
+          description: Сохранённые OCR-чанки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OcrJobResponse"
+        "404":
+          description: Задача не найдена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/jobs/{job_id}/result:
     get:
       tags: [Jobs]
       summary: Финальный результат сравнения (REST fallback)
       description: |
-        Возвращает агрегированный результат после обработки всех чанков.
-        Доступен только когда Aggregator собрал все `processed_results`.
+        Возвращает результат полного иерархического сравнения.
+        Доступен после публикации единственного full-document `processed_results`.
 
         Рекомендуемый способ получения результата — WebSocket (`type: result`).
         Этот endpoint — fallback при обрыве WebSocket или для polling.
@@ -221,7 +272,7 @@ x-kafka:
       key: job_id
   produces:
     - topic: processed_results
-      description: Промежуточные результаты Ollama по каждому чанку
+      description: Один финальный результат иерархического diff на задачу
       schema:
         $ref: "#/components/schemas/ProcessedResultMessage"
       key: job_id
@@ -249,13 +300,13 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status, kafka_connected, ollama_reachable]
+      required: [status, kafka_connected, ollama_reachable, postgres_connected]
       properties:
         status:
           type: string
           enum: [ok, degraded]
           description: |
-            `ok` — Kafka и Ollama доступны;
+            `ok` — Kafka, PostgreSQL и Ollama доступны;
             `degraded` — хотя бы один компонент недоступен
         kafka_connected:
           type: boolean
@@ -263,6 +314,9 @@ components:
         ollama_reachable:
           type: boolean
           description: Ollama API отвечает на GET /api/tags
+        postgres_connected:
+          type: boolean
+          description: PostgreSQL отвечает и OCR-хранилище доступно
 
     JobStatusResponse:
       type: object
@@ -282,27 +336,123 @@ components:
           description: ID документа (обычно совпадает с job_id)
         status:
           type: string
-          enum: [processing, completed, failed]
+          enum: [queued, preparing, processing, ocr_ready, comparing, completed, failed]
           description: |
-            `processing` — идёт обработка чанков или сборка результата;
-            `completed` — все чанки обработаны (финальный статус от Aggregator — через WS);
-            `failed` — ошибка при обработке чанка
+            `processing` — идёт OCR;
+            `ocr_ready` — весь OCR сохранён;
+            `comparing` — выполняется иерархический diff и LLM-проверка;
+            `completed` — результат готов;
+            `failed` — ошибка обработки
         processed_chunks:
           type: integer
           minimum: 0
           description: Число обработанных чанков
         total_chunks:
           type: integer
-          minimum: 1
+          minimum: 0
           description: Общее число чанков в задаче
         message:
           type: string
           description: Человекочитаемое сообщение о текущем шаге
           example: "Анализ chunk 3/10..."
 
+    JobRegisterRequest:
+      type: object
+      required: [job_id]
+      properties:
+        job_id:
+          type: string
+        document_id:
+          type: string
+          nullable: true
+        total_chunks:
+          type: integer
+          minimum: 0
+          default: 0
+        status:
+          type: string
+          default: queued
+        message:
+          type: string
+          default: "Ожидание чанков из Kafka..."
+
+    OcrChunkResponse:
+      type: object
+      required:
+        - chunk_index
+        - side
+        - filename
+        - format
+        - source_content_type
+        - was_ocr
+        - is_missing
+        - text_content
+        - created_at
+        - updated_at
+      properties:
+        chunk_index:
+          type: integer
+          minimum: 1
+        side:
+          type: integer
+          minimum: 1
+          maximum: 2
+        filename:
+          type: string
+        format:
+          type: string
+        source_content_type:
+          type: string
+          enum: [text, image, missing]
+        was_ocr:
+          type: boolean
+        is_missing:
+          type: boolean
+        text_content:
+          type: string
+          description: Полный текст страницы/чанка до сравнения
+        ocr_model:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OcrJobResponse:
+      type: object
+      required:
+        - job_id
+        - document_id
+        - status
+        - total_chunks
+        - processed_chunks
+        - chunks
+      properties:
+        job_id:
+          type: string
+        document_id:
+          type: string
+        status:
+          type: string
+        total_chunks:
+          type: integer
+        processed_chunks:
+          type: integer
+        chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/OcrChunkResponse"
+
     LineDifference:
       type: object
       properties:
+        candidate_id:
+          type: string
+          nullable: true
+          description: Стабильный ID кандидата внутри запуска сравнения
         line_number:
           type: integer
           nullable: true
@@ -339,14 +489,68 @@ components:
             [start, end] — индексы символов внутри file2_line (0-based, start включительно, end исключительно).
             Для подсветки на фронте: file2_line.slice(start, end)
           example: [12, 30]
+        category:
+          type: string
+          enum: [substantive, technical, alignment_error, ocr_uncertain]
+          default: substantive
+        technical_type:
+          type: string
+          nullable: true
+          enum:
+            - markdown
+            - numbering
+            - page_number
+            - list_marker
+            - header_footer
+            - dash
+            - line_wrap
+        reason:
+          type: string
+          nullable: true
+        confidence:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0
+          maximum: 1
+        protection_tags:
+          type: array
+          items:
+            type: string
+        file1_page:
+          type: integer
+          nullable: true
+          minimum: 1
+        file2_page:
+          type: integer
+          nullable: true
+          minimum: 1
+        file1_block:
+          type: integer
+          nullable: true
+          minimum: 1
+        file2_block:
+          type: integer
+          nullable: true
+          minimum: 1
+        file1_source_type:
+          type: string
+          nullable: true
+        file2_source_type:
+          type: string
+          nullable: true
 
     ComparisonResult:
       type: object
-      required: [identical, differences]
+      required: [identical, verdict, differences]
       properties:
         identical:
           type: boolean
-          description: true — все строки совпадают
+          description: true — отсутствуют различия любого типа
+        verdict:
+          type: string
+          enum: [identical, content_equal, different]
+          description: Итог с отдельным состоянием совпадения содержимого
         differences:
           type: array
           items:
@@ -504,7 +708,9 @@ components:
 
     ProcessedResultMessage:
       type: object
-      description: Исходящее сообщение в Kafka topic processed_results
+      description: |
+        Единственное full-document сообщение в Kafka topic processed_results
+        (`chunk_index=1`, `total_chunks=1`).
       required: [job_id, document_id, chunk_index, total_chunks, ollama]
       properties:
         job_id:
@@ -518,21 +724,11 @@ components:
           type: integer
         ollama:
           type: object
-          description: Полный ответ Ollama API (/api/chat)
-          properties:
-            message:
-              type: object
-              properties:
-                role:
-                  type: string
-                  example: assistant
-                content:
-                  type: string
-                  description: JSON-строка с comparison_fragment
+          description: Сводка LLM-проверки детерминированных diff-областей
         comparison_fragment:
           type: object
           nullable: true
-          description: Распарсенный JSON из ответа модели
+          description: Итог алгоритма с подтверждёнными буквальными различиями
           allOf:
             - $ref: "#/components/schemas/ComparisonResult"
         processed_at:

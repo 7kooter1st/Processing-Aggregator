@@ -22,11 +22,14 @@ class KafkaTopicConsumer:
         group_id: str,
         handler: Callable[[dict[str, Any]], Awaitable[None]],
         name: str,
+        *,
+        auto_offset_reset: str = "earliest",
     ) -> None:
         self._topic = topic
         self._group_id = group_id
         self._handler = handler
         self._name = name
+        self._auto_offset_reset = auto_offset_reset
         self._consumer: AIOKafkaConsumer | None = None
         self._task: asyncio.Task | None = None
         self._running = False
@@ -41,7 +44,7 @@ class KafkaTopicConsumer:
             bootstrap_servers=settings.kafka_bootstrap_servers,
             group_id=self._group_id,
             value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-            auto_offset_reset="earliest",
+            auto_offset_reset=self._auto_offset_reset,
             enable_auto_commit=True,
         )
         await self._consumer.start()
@@ -108,6 +111,7 @@ class AggregatorConsumers:
             group_id=f"{settings.kafka_consumer_group_aggregator}-status",
             handler=self._handle_status_update,
             name="StatusRelay",
+            auto_offset_reset="latest",
         )
         self._aggregator = aggregator
         self._ws_hub = ws_hub

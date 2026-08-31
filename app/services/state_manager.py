@@ -104,13 +104,29 @@ class StateManager:
                 f"Обработка {progress.progress_text()} завершена для chunk {chunk_index}"
             )
 
-            if progress.is_complete and progress.status != "completed":
-                progress.status = "completed"
+            if progress.is_complete and progress.status != "ocr_ready":
+                progress.status = "ocr_ready"
+                progress.last_message = "OCR всех фрагментов сохранён"
                 for callback in self._completion_callbacks:
                     callback(progress)
                 return progress, True
 
             return progress, False
+
+    async def set_status(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        message: str,
+    ) -> JobProgress | None:
+        async with self._lock:
+            progress = self._jobs.get(job_id)
+            if progress is None:
+                return None
+            progress.status = status
+            progress.last_message = message
+            return progress
 
     async def mark_failed(self, job_id: str, error: str) -> JobProgress | None:
         async with self._lock:

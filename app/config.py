@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 5001
 
+    database_url: str = (
+        "postgresql://comparator:comparator@127.0.0.1:5432/comparator"
+    )
+    database_pool_min_size: int = 1
+    database_pool_max_size: int = 5
+
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_consumer_group: str = "processing-service"
     kafka_topic_raw_chunks: str = "raw_chunks"
@@ -22,6 +28,7 @@ class Settings(BaseSettings):
     # Prefer 127.0.0.1 over localhost to avoid IPv6 (::1) connect failures on Windows.
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma4"
+    ollama_num_ctx: int = 8192
     ollama_timeout_seconds: float = 300.0
     ollama_temperature: float = 0.1
     ollama_think: bool = False

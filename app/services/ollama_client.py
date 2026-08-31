@@ -15,6 +15,7 @@ class OllamaClient:
     def __init__(self) -> None:
         self._base_url = settings.ollama_base_url.rstrip("/")
         self._model = settings.ollama_model
+        self._num_ctx = settings.ollama_num_ctx
         self._timeout = settings.ollama_timeout_seconds
         self._temperature = settings.ollama_temperature
         self._think = settings.ollama_think
@@ -90,6 +91,7 @@ class OllamaClient:
             "think": self._think,
             "options": {
                 "temperature": self._temperature,
+                "num_ctx": self._num_ctx,
             },
         }
         if response_format == "json":
@@ -101,12 +103,14 @@ class OllamaClient:
             if isinstance(msg, dict) and msg.get("images")
         )
         logger.info(
-            "[OLLAMA] %s request model=%s messages=%s images=%s temperature=%s think=%s format=%s",
+            "[OLLAMA] %s request model=%s messages=%s images=%s "
+            "temperature=%s num_ctx=%s think=%s format=%s",
             phase,
             self._model,
             len(messages),
             image_count,
             self._temperature,
+            self._num_ctx,
             self._think,
             response_format,
         )
@@ -121,8 +125,8 @@ class OllamaClient:
                         f"{self._base_url}/api/chat",
                         json=payload,
                     )
-                    if response.status_code >= 500:
-                        body_preview = (response.text or "")[:300]
+                    if response.status_code >= 400:
+                        body_preview = (response.text or "")[:500]
                         raise httpx.HTTPStatusError(
                             f"Ollama {response.status_code}: {body_preview}",
                             request=response.request,

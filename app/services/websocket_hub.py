@@ -40,8 +40,8 @@ class WebSocketHub:
             clients = list(self._connections.get(job_id, set()))
 
         if not clients:
-            logger.warning(
-                "[WS] no clients for job=%s — event type=%s not delivered (frontend not connected?)",
+            logger.debug(
+                "[WS] no clients for job=%s — event type=%s not delivered",
                 job_id,
                 event.type,
             )
