@@ -81,8 +81,8 @@ class ChunkProcessor:
                         ),
                         total_chunks=message.total_chunks,
                         message=(
-                            f"Распознавание chunk "
-                            f"{message.chunk_index}/{message.total_chunks}..."
+                            f"Выполняется сканирование файлов: "
+                            f"{message.chunk_index} из {message.total_chunks}"
                         ),
                     )
                 )
@@ -114,8 +114,8 @@ class ChunkProcessor:
                 processed_chunks=stored_chunks,
                 total_chunks=message.total_chunks,
                 message=(
-                    f"OCR сохранён в PostgreSQL: "
-                    f"{stored_chunks}/{message.total_chunks}"
+                    f"Выполняется сканирование файлов: "
+                    f"{stored_chunks} из {message.total_chunks}"
                 ),
             )
         )
@@ -127,7 +127,7 @@ class ChunkProcessor:
             await self._state.set_status(
                 message.job_id,
                 status="ocr_ready",
-                message="OCR всех страниц сохранён в PostgreSQL",
+                message="Сканирование завершено, начинается сравнение",
             )
         await self._comparator.compare_if_ready(message.job_id)
 
@@ -211,9 +211,13 @@ class ChunkProcessor:
         document_id = raw_payload.get("document_id", "unknown")
         total_chunks = raw_payload.get("total_chunks", 0)
         chunk_index = raw_payload.get("chunk_index", 0)
+        user_error = (
+            f"Не удалось обработать страницу {chunk_index}. "
+            "Попробуйте загрузить документы ещё раз."
+        )
 
-        await self._state.mark_failed(job_id, error)
-        await self._store.mark_failed(job_id, error)
+        await self._state.mark_failed(job_id, user_error)
+        await self._store.mark_failed(job_id, user_error)
         logger.error(
             "[PROCESS] error job=%s chunk=%s: %s",
             job_id,
@@ -228,6 +232,6 @@ class ChunkProcessor:
                 status="failed",
                 processed_chunks=0,
                 total_chunks=total_chunks,
-                message=f"Ошибка chunk {chunk_index}: {error}",
+                message=user_error,
             )
         )

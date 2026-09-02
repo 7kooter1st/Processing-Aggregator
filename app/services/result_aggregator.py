@@ -138,7 +138,7 @@ class ResultAggregator:
                 status="completed",
                 processed_chunks=total_chunks,
                 total_chunks=total_chunks,
-                message=f"Document {document_id}: готово! Результат готов.",
+                message="Сравнение завершено",
             )
         )
 

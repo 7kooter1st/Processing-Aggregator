@@ -358,10 +358,13 @@ components:
 
     JobRegisterRequest:
       type: object
-      required: [job_id]
+      required: [job_id, user_id]
       properties:
         job_id:
           type: string
+        user_id:
+          type: string
+          format: uuid
         document_id:
           type: string
           nullable: true
@@ -375,6 +378,12 @@ components:
         message:
           type: string
           default: "Ожидание чанков из Kafka..."
+        file1_name:
+          type: string
+          default: ""
+        file2_name:
+          type: string
+          default: ""
 
     OcrChunkResponse:
       type: object

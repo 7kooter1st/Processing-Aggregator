@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -86,10 +87,13 @@ class JobRegisterRequest(BaseModel):
     """Early registration from Chunking before the first Kafka chunk arrives."""
 
     job_id: str
+    user_id: UUID
     document_id: str | None = None
     total_chunks: int = 0
     status: str = "queued"
-    message: str = "Ожидание чанков из Kafka..."
+    message: str = "Процесс в очереди",
+    file1_name: str = ""
+    file2_name: str = ""
 
 
 class OcrChunkResponse(BaseModel):

@@ -1,8 +1,9 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from app.api.websocket import create_websocket_router
 from app.config import settings
@@ -129,6 +130,19 @@ app = FastAPI(
 app.include_router(create_websocket_router(ws_hub, aggregator))
 
 
+async def require_internal_token(
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+) -> None:
+    expected = settings.internal_api_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="INTERNAL_API_TOKEN is not configured",
+        )
+    if x_internal_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid internal token")
+
+
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health() -> HealthResponse:
     ollama_ok = await ollama_client.is_available()
@@ -148,9 +162,16 @@ async def health() -> HealthResponse:
     )
 
 
-@app.get("/api/jobs", response_model=list[JobStatusResponse], tags=["Jobs"])
-async def list_jobs() -> list[JobStatusResponse]:
-    jobs = await ocr_store.list_jobs()
+@app.get(
+    "/api/jobs",
+    response_model=list[JobStatusResponse],
+    tags=["Jobs"],
+    dependencies=[Depends(require_internal_token)],
+)
+async def list_jobs(
+    user_id: UUID = Query(..., description="Owner filter; required"),
+) -> list[JobStatusResponse]:
+    jobs = await ocr_store.list_jobs(user_id=user_id)
     return [
         JobStatusResponse(
             job_id=job["job_id"],
@@ -164,15 +185,23 @@ async def list_jobs() -> list[JobStatusResponse]:
     ]
 
 
-@app.post("/api/jobs", response_model=JobStatusResponse, tags=["Jobs"])
+@app.post(
+    "/api/jobs",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    dependencies=[Depends(require_internal_token)],
+)
 async def register_job(body: JobRegisterRequest) -> JobStatusResponse:
     """Register a job early so Chunking polling does not see 404 before Kafka."""
     db_job = await ocr_store.ensure_job(
         job_id=body.job_id,
         document_id=body.document_id or body.job_id,
+        user_id=body.user_id,
         total_chunks=body.total_chunks,
         status=body.status,
         message=body.message,
+        file1_name=body.file1_name,
+        file2_name=body.file2_name,
     )
     await state_manager.ensure_job(
         job_id=body.job_id,
@@ -191,7 +220,12 @@ async def register_job(body: JobRegisterRequest) -> JobStatusResponse:
     )
 
 
-@app.get("/api/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
+@app.get(
+    "/api/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    dependencies=[Depends(require_internal_token)],
+)
 async def get_job(job_id: str) -> JobStatusResponse:
     job = await ocr_store.get_job(job_id)
     if job is None:
@@ -211,6 +245,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
     "/api/jobs/{job_id}/ocr",
     response_model=OcrJobResponse,
     tags=["Jobs"],
+    dependencies=[Depends(require_internal_token)],
 )
 async def get_job_ocr(
     job_id: str,
@@ -232,7 +267,12 @@ async def get_job_ocr(
     )
 
 
-@app.get("/api/jobs/{job_id}/result", response_model=ResultResponse, tags=["Jobs"])
+@app.get(
+    "/api/jobs/{job_id}/result",
+    response_model=ResultResponse,
+    tags=["Jobs"],
+    dependencies=[Depends(require_internal_token)],
+)
 async def get_job_result(job_id: str) -> ResultResponse:
     result = await aggregator.get_result(job_id)
     if result is None:
@@ -246,8 +286,11 @@ async def get_job_result(job_id: str) -> ResultResponse:
 if __name__ == "__main__":
     import uvicorn
 
+    # Pass the app object, not "main:app". The string form re-imports this
+    # module and would register WebSocket handlers against an OcrStore that
+    # never runs lifespan (pool stays None).
     uvicorn.run(
-        "main:app",
+        app,
         host=settings.app_host,
         port=settings.app_port,
         reload=False,

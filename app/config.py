@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     )
     database_pool_min_size: int = 1
     database_pool_max_size: int = 5
+    internal_api_token: str = ""
 
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_consumer_group: str = "processing-service"

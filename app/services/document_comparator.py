@@ -59,12 +59,12 @@ class DocumentComparator:
                 document_id=documents.document_id,
                 total_chunks=documents.total_chunks,
                 status="processing",
-                message="Иерархический diff документов...",
+                message="Сравнение документов…",
             )
             await self._state.set_status(
                 job_id,
                 status="comparing",
-                message="Иерархический diff документов...",
+                message="Сравнение документов…",
             )
 
             await self._publish_status(
@@ -74,10 +74,7 @@ class DocumentComparator:
                     status="processing",
                     processed_chunks=documents.total_chunks,
                     total_chunks=documents.total_chunks,
-                    message=(
-                        "OCR сохранён. Иерархическое сравнение блоков, "
-                        "слов и символов. Не перезапускайте Processing."
-                    ),
+                    message="Сравнение документов…",
                 )
             )
 
@@ -120,9 +117,7 @@ class DocumentComparator:
             await self._state.set_status(
                 job_id,
                 status="classifying",
-                message=(
-                    f"Классификация {len(candidates)} diff-кандидатов..."
-                ),
+                message="Проверка найденных различий…",
             )
             await self._publish_status(
                 StatusUpdateMessage(
@@ -131,10 +126,7 @@ class DocumentComparator:
                     status="processing",
                     processed_chunks=documents.total_chunks,
                     total_chunks=documents.total_chunks,
-                    message=(
-                        f"Diff построен. Классификация "
-                        f"{len(candidates)} кандидатов..."
-                    ),
+                    message="Проверка найденных различий…",
                 )
             )
             classified, classification_summary = await self._classifier.classify(
@@ -209,9 +201,10 @@ class DocumentComparator:
             )
             return True
         except Exception as exc:
-            error = f"Ошибка сравнения сохранённого OCR: {exc}"
+            logger.exception("[DIFF] comparison failed job=%s", job_id)
             if run_id is not None and not result_saved:
-                await self._store.mark_comparison_run_failed(run_id, error)
+                await self._store.mark_comparison_run_failed(run_id, str(exc))
+            error = "Не удалось сравнить документы. Попробуйте ещё раз."
             await self._store.mark_failed(job_id, error)
             await self._state.mark_failed(job_id, error)
             db_job = await self._store.get_job(job_id)

@@ -75,7 +75,7 @@ class OcrStore:
                 UPDATE comparison_jobs
                 SET comparison_claimed = FALSE,
                     status = 'ocr_ready',
-                    last_message = 'OCR сохранён; сравнение будет возобновлено',
+                    last_message = 'Сканирование завершено, сравнение будет продолжено',
                     updated_at = NOW()
                 WHERE status = 'comparing'
                 """
@@ -106,9 +106,36 @@ class OcrStore:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_by UUID NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id UUID PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    user_id UUID NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    revoked_at TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sessions_user
+                    ON sessions(user_id);
+
                 CREATE TABLE IF NOT EXISTS comparison_jobs (
                     job_id TEXT PRIMARY KEY,
                     document_id TEXT NOT NULL,
+                    user_id UUID NOT NULL REFERENCES users(id),
+                    file1_name TEXT NOT NULL DEFAULT '',
+                    file2_name TEXT NOT NULL DEFAULT '',
                     total_chunks INTEGER NOT NULL DEFAULT 0,
                     processed_chunks INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'queued',
@@ -117,6 +144,9 @@ class OcrStore:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_comparison_jobs_user
+                    ON comparison_jobs(user_id, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS ocr_chunks (
                     job_id TEXT NOT NULL
@@ -137,6 +167,20 @@ class OcrStore:
 
                 CREATE INDEX IF NOT EXISTS idx_ocr_chunks_job_side
                     ON ocr_chunks(job_id, side, chunk_index);
+
+                CREATE TABLE IF NOT EXISTS job_files (
+                    id UUID PRIMARY KEY,
+                    job_id TEXT NOT NULL
+                        REFERENCES comparison_jobs(job_id) ON DELETE CASCADE,
+                    side SMALLINT NOT NULL CHECK (side IN (1, 2)),
+                    original_filename TEXT NOT NULL,
+                    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                    size_bytes BIGINT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    storage_path TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (job_id, side)
+                );
 
                 CREATE TABLE IF NOT EXISTS comparison_runs (
                     run_id UUID PRIMARY KEY,
@@ -234,9 +278,12 @@ class OcrStore:
         *,
         job_id: str,
         document_id: str,
+        user_id: uuid.UUID,
         total_chunks: int = 0,
         status: str = "queued",
         message: str = "",
+        file1_name: str = "",
+        file2_name: str = "",
     ) -> dict[str, Any]:
         pool = self._require_pool()
         async with pool.acquire() as conn:
@@ -247,6 +294,9 @@ class OcrStore:
                 total_chunks=total_chunks,
                 status=status,
                 message=message,
+                user_id=user_id,
+                file1_name=file1_name,
+                file2_name=file2_name,
             )
         return dict(row)
 
@@ -259,13 +309,73 @@ class OcrStore:
         total_chunks: int,
         status: str,
         message: str,
+        user_id: uuid.UUID | None = None,
+        file1_name: str = "",
+        file2_name: str = "",
     ) -> asyncpg.Record:
+        if user_id is None:
+            row = await conn.fetchrow(
+                """
+                UPDATE comparison_jobs
+                SET document_id = $2,
+                    total_chunks = CASE
+                        WHEN $3 > 0
+                        THEN GREATEST(comparison_jobs.total_chunks, $3)
+                        ELSE comparison_jobs.total_chunks
+                    END,
+                    status = CASE
+                        WHEN $4 = 'failed' THEN 'failed'
+                        WHEN comparison_jobs.status IN (
+                            'ocr_ready', 'comparing', 'completed', 'failed'
+                        ) AND $4 IN (
+                            'queued', 'preparing', 'processing'
+                        )
+                        THEN comparison_jobs.status
+                        ELSE $4
+                    END,
+                    last_message = CASE
+                        WHEN $5 <> '' THEN $5
+                        ELSE comparison_jobs.last_message
+                    END,
+                    file1_name = CASE
+                        WHEN $6 <> '' THEN $6
+                        ELSE comparison_jobs.file1_name
+                    END,
+                    file2_name = CASE
+                        WHEN $7 <> '' THEN $7
+                        ELSE comparison_jobs.file2_name
+                    END,
+                    updated_at = NOW()
+                WHERE job_id = $1
+                RETURNING *
+                """,
+                job_id,
+                document_id,
+                total_chunks,
+                status,
+                message,
+                file1_name,
+                file2_name,
+            )
+            if row is None:
+                raise KeyError(
+                    f"Job {job_id} is not registered; user_id is required"
+                )
+            return row
+
         return await conn.fetchrow(
             """
             INSERT INTO comparison_jobs (
-                job_id, document_id, total_chunks, status, last_message
+                job_id,
+                document_id,
+                user_id,
+                file1_name,
+                file2_name,
+                total_chunks,
+                status,
+                last_message
             )
-            VALUES ($1, $2, GREATEST($3, 0), $4, $5)
+            VALUES ($1, $2, $3, $4, $5, GREATEST($6, 0), $7, $8)
             ON CONFLICT (job_id) DO UPDATE SET
                 document_id = EXCLUDED.document_id,
                 total_chunks = CASE
@@ -291,11 +401,24 @@ class OcrStore:
                     THEN EXCLUDED.last_message
                     ELSE comparison_jobs.last_message
                 END,
+                file1_name = CASE
+                    WHEN EXCLUDED.file1_name <> ''
+                    THEN EXCLUDED.file1_name
+                    ELSE comparison_jobs.file1_name
+                END,
+                file2_name = CASE
+                    WHEN EXCLUDED.file2_name <> ''
+                    THEN EXCLUDED.file2_name
+                    ELSE comparison_jobs.file2_name
+                END,
                 updated_at = NOW()
             RETURNING *
             """,
             job_id,
             document_id,
+            user_id,
+            file1_name,
+            file2_name,
             total_chunks,
             status,
             message,
@@ -332,8 +455,8 @@ class OcrStore:
                     total_chunks=message.total_chunks,
                     status="processing",
                     message=(
-                        f"OCR chunk {message.chunk_index}/"
-                        f"{message.total_chunks} сохраняется"
+                        f"Выполняется сканирование файлов: "
+                        f"{message.chunk_index} из {message.total_chunks}"
                     ),
                 )
                 await self._save_side(
@@ -370,11 +493,11 @@ class OcrStore:
                 )
                 status = "ocr_ready" if ready else "processing"
                 status_message = (
-                    "OCR всех страниц сохранён в PostgreSQL"
+                    "Сканирование завершено, начинается сравнение"
                     if ready
                     else (
-                        f"OCR сохранён в PostgreSQL: "
-                        f"{stored_chunks}/{message.total_chunks}"
+                        f"Выполняется сканирование файлов: "
+                        f"{stored_chunks} из {message.total_chunks}"
                     )
                 )
                 await conn.execute(
@@ -474,7 +597,7 @@ class OcrStore:
                 UPDATE comparison_jobs
                 SET comparison_claimed = TRUE,
                     status = 'comparing',
-                    last_message = 'Иерархический diff и проверка различий',
+                    last_message = 'Сравнение документов…',
                     updated_at = NOW()
                 WHERE job_id = $1
                   AND comparison_claimed = FALSE
@@ -540,17 +663,40 @@ class OcrStore:
             )
         return None if row is None else dict(row)
 
-    async def list_jobs(self) -> list[dict[str, Any]]:
+    async def list_jobs(
+        self,
+        user_id: uuid.UUID | None = None,
+    ) -> list[dict[str, Any]]:
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT *
-                FROM comparison_jobs
-                ORDER BY created_at DESC
-                """
-            )
+            if user_id is None:
+                rows = await conn.fetch(
+                    """
+                    SELECT *
+                    FROM comparison_jobs
+                    ORDER BY created_at DESC
+                    """
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT *
+                    FROM comparison_jobs
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    """,
+                    user_id,
+                )
         return [dict(row) for row in rows]
+
+    async def delete_job(self, job_id: str) -> bool:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM comparison_jobs WHERE job_id = $1",
+                job_id,
+            )
+        return result == "DELETE 1"
 
     async def list_ready_jobs(self) -> list[str]:
         pool = self._require_pool()

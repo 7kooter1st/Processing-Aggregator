@@ -25,7 +25,7 @@ class StateManager:
         document_id: str | None = None,
         total_chunks: int = 0,
         status: str = "queued",
-        message: str = "Ожидание чанков из Kafka...",
+        message: str = "Процесс в очереди",
     ) -> JobProgress:
         """Create or refresh a job before Kafka chunks arrive."""
         async with self._lock:
@@ -80,8 +80,8 @@ class StateManager:
                 if job.status in {"queued", "preparing"}:
                     job.status = "processing"
                     job.last_message = (
-                        f"Обработка chunk {message.chunk_index}/"
-                        f"{message.total_chunks}..."
+                        f"Выполняется сканирование файлов: "
+                        f"{message.chunk_index} из {message.total_chunks}"
                     )
             return self._jobs[key]
 
@@ -101,12 +101,13 @@ class StateManager:
 
             progress.processed_chunks.add(chunk_index)
             progress.last_message = (
-                f"Обработка {progress.progress_text()} завершена для chunk {chunk_index}"
+                f"Выполняется сканирование файлов: "
+                f"{len(progress.processed_chunks)} из {progress.total_chunks}"
             )
 
             if progress.is_complete and progress.status != "ocr_ready":
                 progress.status = "ocr_ready"
-                progress.last_message = "OCR всех фрагментов сохранён"
+                progress.last_message = "Сканирование завершено, начинается сравнение"
                 for callback in self._completion_callbacks:
                     callback(progress)
                 return progress, True
