@@ -25,6 +25,8 @@ class KafkaPublisher:
             value_serializer=lambda value: json.dumps(value).encode("utf-8"),
             key_serializer=lambda key: key.encode("utf-8") if key else None,
             max_request_size=settings.kafka_max_request_size_bytes,
+            acks="all",
+            enable_idempotence=True,
         )
         await self._producer.start()
         logger.info("Kafka producer connected to %s", settings.kafka_bootstrap_servers)
@@ -47,6 +49,9 @@ class KafkaPublisher:
             key=status.job_id,
             value=status.model_dump(),
         )
+
+    async def publish_raw(self, topic: str, key: str | None, value: dict[str, Any]) -> None:
+        await self._send(topic, key, value)
 
     async def publish_to_dlt(self, payload: dict[str, Any], error: str) -> None:
         # Never push full page images into DLT — that floods logs and can exceed Kafka limits.

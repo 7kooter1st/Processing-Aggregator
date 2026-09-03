@@ -72,6 +72,7 @@ class HealthResponse(BaseModel):
     kafka_connected: bool
     ollama_reachable: bool
     postgres_connected: bool
+    object_store_connected: bool = True
 
 
 class JobStatusResponse(BaseModel):

@@ -8,6 +8,7 @@ import asyncpg
 
 from app.config import settings
 from app.models.schemas import ChunkContent, ContentType, RawChunkMessage
+from app.workflow.repository import WorkflowRepository
 
 logger = logging.getLogger(__name__)
 
@@ -46,41 +47,25 @@ class OcrStore:
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        self._worker_id = settings.worker_id or f"processing-{uuid.uuid4()}"
+        self.workflow: WorkflowRepository | None = None
 
     async def start(self) -> None:
+        from app.db_migrate import upgrade_to_head
+
+        upgrade_to_head()
         self._pool = await asyncpg.create_pool(
             dsn=settings.database_url,
             min_size=settings.database_pool_min_size,
             max_size=settings.database_pool_max_size,
             command_timeout=30,
         )
-        await self._create_schema()
-        # A process may have stopped after claiming a finished OCR job. Make it
-        # eligible for comparison again; no OCR has to be repeated.
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE comparison_runs
-                SET status = 'failed',
-                    error_message = COALESCE(
-                        error_message,
-                        'Processing restarted during comparison'
-                    ),
-                    finished_at = COALESCE(finished_at, NOW())
-                WHERE status = 'running'
-                """
-            )
-            await conn.execute(
-                """
-                UPDATE comparison_jobs
-                SET comparison_claimed = FALSE,
-                    status = 'ocr_ready',
-                    last_message = 'Сканирование завершено, сравнение будет продолжено',
-                    updated_at = NOW()
-                WHERE status = 'comparing'
-                """
-            )
-        logger.info("[POSTGRES] OCR store connected and schema ready")
+        self.workflow = WorkflowRepository(self._pool)
+        await self._recover_local_leases()
+        logger.info(
+            "[POSTGRES] OCR store connected worker=%s schema ready",
+            self._worker_id,
+        )
 
     async def stop(self) -> None:
         if self._pool is not None:
@@ -101,176 +86,48 @@ class OcrStore:
             raise RuntimeError("PostgreSQL OCR store is not started")
         return self._pool
 
-    async def _create_schema(self) -> None:
+    async def _recover_local_leases(self) -> None:
         pool = self._require_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS users (
-                    id UUID PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
-                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    created_by UUID NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id UUID PRIMARY KEY,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    user_id UUID NOT NULL
-                        REFERENCES users(id) ON DELETE CASCADE,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    revoked_at TIMESTAMPTZ NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_sessions_user
-                    ON sessions(user_id);
-
-                CREATE TABLE IF NOT EXISTS comparison_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    document_id TEXT NOT NULL,
-                    user_id UUID NOT NULL REFERENCES users(id),
-                    file1_name TEXT NOT NULL DEFAULT '',
-                    file2_name TEXT NOT NULL DEFAULT '',
-                    total_chunks INTEGER NOT NULL DEFAULT 0,
-                    processed_chunks INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    last_message TEXT NOT NULL DEFAULT '',
-                    comparison_claimed BOOLEAN NOT NULL DEFAULT FALSE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_comparison_jobs_user
-                    ON comparison_jobs(user_id, created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS ocr_chunks (
-                    job_id TEXT NOT NULL
-                        REFERENCES comparison_jobs(job_id) ON DELETE CASCADE,
-                    chunk_index INTEGER NOT NULL CHECK (chunk_index >= 1),
-                    side SMALLINT NOT NULL CHECK (side IN (1, 2)),
-                    filename TEXT NOT NULL DEFAULT '',
-                    format TEXT NOT NULL DEFAULT '',
-                    source_content_type TEXT NOT NULL,
-                    was_ocr BOOLEAN NOT NULL DEFAULT FALSE,
-                    is_missing BOOLEAN NOT NULL DEFAULT FALSE,
-                    text_content TEXT NOT NULL DEFAULT '',
-                    ocr_model TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (job_id, chunk_index, side)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_ocr_chunks_job_side
-                    ON ocr_chunks(job_id, side, chunk_index);
-
-                CREATE TABLE IF NOT EXISTS job_files (
-                    id UUID PRIMARY KEY,
-                    job_id TEXT NOT NULL
-                        REFERENCES comparison_jobs(job_id) ON DELETE CASCADE,
-                    side SMALLINT NOT NULL CHECK (side IN (1, 2)),
-                    original_filename TEXT NOT NULL,
-                    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-                    size_bytes BIGINT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    storage_path TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (job_id, side)
-                );
-
-                CREATE TABLE IF NOT EXISTS comparison_runs (
-                    run_id UUID PRIMARY KEY,
-                    job_id TEXT NOT NULL
-                        REFERENCES comparison_jobs(job_id) ON DELETE CASCADE,
-                    run_number INTEGER NOT NULL CHECK (run_number >= 1),
-                    status TEXT NOT NULL DEFAULT 'running'
-                        CHECK (status IN ('running', 'completed', 'failed')),
-                    algorithm_version TEXT NOT NULL,
-                    ollama_model TEXT NOT NULL,
-                    prompt_version TEXT NOT NULL,
-                    settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    error_message TEXT,
-                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    finished_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (job_id, run_number)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_comparison_runs_job
-                    ON comparison_runs(job_id, run_number DESC);
-
-                CREATE TABLE IF NOT EXISTS diff_candidates (
-                    run_id UUID NOT NULL
-                        REFERENCES comparison_runs(run_id) ON DELETE CASCADE,
-                    candidate_id TEXT NOT NULL,
-                    sort_order INTEGER NOT NULL CHECK (sort_order >= 1),
-                    candidate_json JSONB NOT NULL,
-                    category TEXT
-                        CHECK (
-                            category IS NULL OR category IN (
-                                'substantive',
-                                'technical',
-                                'alignment_error',
-                                'ocr_uncertain'
-                            )
-                        ),
-                    technical_type TEXT,
-                    reason TEXT,
-                    confidence DOUBLE PRECISION,
-                    protection_tags TEXT[] NOT NULL DEFAULT '{}',
-                    classified_by TEXT,
-                    included_in_result BOOLEAN NOT NULL DEFAULT TRUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (run_id, candidate_id),
-                    UNIQUE (run_id, sort_order)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_diff_candidates_run_category
-                    ON diff_candidates(run_id, category, sort_order);
-
-                ALTER TABLE diff_candidates
-                    ADD COLUMN IF NOT EXISTS included_in_result
-                    BOOLEAN NOT NULL DEFAULT TRUE;
-
-                CREATE TABLE IF NOT EXISTS classification_batches (
-                    run_id UUID NOT NULL
-                        REFERENCES comparison_runs(run_id) ON DELETE CASCADE,
-                    batch_index INTEGER NOT NULL CHECK (batch_index >= 1),
-                    candidate_ids TEXT[] NOT NULL,
-                    request_json JSONB NOT NULL,
-                    response_json JSONB,
-                    parse_ok BOOLEAN NOT NULL DEFAULT FALSE,
-                    failure_reason TEXT,
-                    latency_ms INTEGER,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (run_id, batch_index)
-                );
-
-                CREATE TABLE IF NOT EXISTS comparison_results (
-                    run_id UUID PRIMARY KEY
-                        REFERENCES comparison_runs(run_id) ON DELETE CASCADE,
-                    job_id TEXT NOT NULL
-                        REFERENCES comparison_jobs(job_id) ON DELETE CASCADE,
-                    verdict TEXT NOT NULL
-                        CHECK (
-                            verdict IN (
-                                'identical', 'content_equal', 'different'
-                            )
-                        ),
-                    comparison_json JSONB NOT NULL,
-                    difference_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_comparison_results_job
-                    ON comparison_results(job_id, created_at DESC);
+                UPDATE comparison_runs
+                SET status = 'failed',
+                    error_message = COALESCE(
+                        error_message,
+                        'Processing restarted during comparison'
+                    ),
+                    finished_at = COALESCE(finished_at, NOW())
+                WHERE status = 'running'
+                  AND job_id IN (
+                      SELECT job_id FROM comparison_jobs
+                      WHERE lease_owner = $1
+                         OR lease_owner IS NULL
+                         OR lease_expires_at IS NULL
+                         OR lease_expires_at < NOW()
+                  )
+                """,
+                self._worker_id,
+            )
+            await conn.execute(
                 """
+                UPDATE comparison_jobs
+                SET comparison_claimed = FALSE,
+                    status = 'ocr_ready',
+                    last_message = 'Сканирование завершено, сравнение будет продолжено',
+                    lease_owner = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE status = 'comparing'
+                  AND (
+                      lease_owner = $1
+                      OR lease_owner IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at < NOW()
+                  )
+                """,
+                self._worker_id,
             )
 
     async def ensure_job(
@@ -326,7 +183,8 @@ class OcrStore:
                     status = CASE
                         WHEN $4 = 'failed' THEN 'failed'
                         WHEN comparison_jobs.status IN (
-                            'ocr_ready', 'comparing', 'completed', 'failed'
+                            'ocr_ready', 'comparing', 'completed', 'failed',
+                            'cancelled', 'deleted', 'deleting'
                         ) AND $4 IN (
                             'queued', 'preparing', 'processing'
                         )
@@ -389,7 +247,8 @@ class OcrStore:
                 status = CASE
                     WHEN EXCLUDED.status = 'failed' THEN 'failed'
                     WHEN comparison_jobs.status IN (
-                        'ocr_ready', 'comparing', 'completed', 'failed'
+                        'ocr_ready', 'comparing', 'completed', 'failed',
+                        'cancelled', 'deleted', 'deleting'
                     ) AND EXCLUDED.status IN (
                         'queued', 'preparing', 'processing'
                     )
@@ -506,7 +365,8 @@ class OcrStore:
                     SET processed_chunks = GREATEST(processed_chunks, $2),
                         status = CASE
                             WHEN status IN (
-                                'failed', 'completed', 'comparing', 'ocr_ready'
+                                'failed', 'completed', 'comparing', 'ocr_ready',
+                                'cancelled', 'deleted', 'deleting'
                             )
                             THEN status
                             ELSE $3
@@ -591,6 +451,7 @@ class OcrStore:
 
     async def try_claim_comparison(self, job_id: str) -> bool:
         pool = self._require_pool()
+        token = uuid.uuid4()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -598,15 +459,27 @@ class OcrStore:
                 SET comparison_claimed = TRUE,
                     status = 'comparing',
                     last_message = 'Сравнение документов…',
+                    lease_owner = $2,
+                    lease_token = $3,
+                    lease_epoch = lease_epoch + 1,
+                    lease_expires_at = NOW() + ($4 || ' seconds')::interval,
+                    comparing_at = COALESCE(comparing_at, NOW()),
+                    state_version = state_version + 1,
                     updated_at = NOW()
                 WHERE job_id = $1
                   AND comparison_claimed = FALSE
-                  AND status NOT IN ('failed', 'completed')
+                  AND status NOT IN (
+                      'failed', 'completed', 'cancelled', 'deleted', 'deleting'
+                  )
+                  AND cancel_requested_at IS NULL
                   AND total_chunks > 0
                   AND processed_chunks >= total_chunks
                 RETURNING job_id
                 """,
                 job_id,
+                self._worker_id,
+                token,
+                str(settings.lease_seconds),
             )
         return row is not None
 
@@ -626,6 +499,104 @@ class OcrStore:
             release_claim=True,
         )
 
+    async def request_cancel(self, job_id: str) -> dict[str, Any] | None:
+        if self.workflow is None:
+            raise RuntimeError("Workflow repository is not ready")
+        return await self.workflow.request_cancel(job_id)
+
+    async def finalize_comparison(
+        self,
+        run_id: str,
+        *,
+        job_id: str,
+        comparison: dict[str, Any],
+    ) -> None:
+        pool = self._require_pool()
+        verdict = str(comparison["verdict"])
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO comparison_results (
+                        run_id,
+                        job_id,
+                        verdict,
+                        comparison_json,
+                        difference_count
+                    )
+                    VALUES ($1, $2, $3, $4::jsonb, $5)
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        verdict = EXCLUDED.verdict,
+                        comparison_json = EXCLUDED.comparison_json,
+                        difference_count = EXCLUDED.difference_count
+                    """,
+                    uuid.UUID(run_id),
+                    job_id,
+                    verdict,
+                    json.dumps(comparison, ensure_ascii=False),
+                    len(comparison.get("differences") or []),
+                )
+                await conn.execute(
+                    """
+                    UPDATE comparison_runs
+                    SET status = 'completed',
+                        finished_at = NOW(),
+                        error_message = NULL
+                    WHERE run_id = $1
+                    """,
+                    uuid.UUID(run_id),
+                )
+                await conn.execute(
+                    """
+                    UPDATE comparison_jobs
+                    SET status = 'completed',
+                        last_message = 'Сравнение завершено',
+                        comparison_claimed = TRUE,
+                        completed_at = COALESCE(completed_at, NOW()),
+                        state_version = state_version + 1,
+                        lease_owner = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = NOW()
+                    WHERE job_id = $1
+                      AND status NOT IN ('cancelled', 'deleted')
+                    """,
+                    job_id,
+                )
+                if self.workflow is not None:
+                    await self.workflow.append_job_event(
+                        conn,
+                        job_id=job_id,
+                        event_type="job.completed",
+                        payload={"verdict": verdict, "run_id": run_id},
+                    )
+                    await self.workflow.enqueue_outbox(
+                        conn,
+                        job_id=job_id,
+                        topic=settings.kafka_topic_job_event,
+                        key=job_id,
+                        payload={
+                            "event_type": "job.completed",
+                            "job_id": job_id,
+                            "pipeline_version": settings.pipeline_version,
+                            "result_available": True,
+                        },
+                    )
+                    await self.workflow.enqueue_outbox(
+                        conn,
+                        job_id=job_id,
+                        topic=settings.kafka_topic_processed_results,
+                        key=job_id,
+                        payload={
+                            "job_id": job_id,
+                            "document_id": job_id,
+                            "chunk_index": 1,
+                            "total_chunks": 1,
+                            "ollama": {"stage": "finalize", "run_id": run_id},
+                            "comparison_fragment": comparison,
+                        },
+                    )
+
     async def _set_status(
         self,
         job_id: str,
@@ -639,12 +610,45 @@ class OcrStore:
             await conn.execute(
                 """
                 UPDATE comparison_jobs
-                SET status = $2,
-                    last_message = $3,
+                SET status = CASE
+                        WHEN comparison_jobs.status IN (
+                            'completed', 'cancelled', 'deleted'
+                        )
+                        THEN comparison_jobs.status
+                        ELSE $2
+                    END,
+                    last_message = CASE
+                        WHEN comparison_jobs.status IN (
+                            'completed', 'cancelled', 'deleted'
+                        )
+                        THEN comparison_jobs.last_message
+                        ELSE $3
+                    END,
+                    failure_code = CASE
+                        WHEN $2 = 'failed' THEN 'pipeline_error'
+                        ELSE failure_code
+                    END,
+                    failed_at = CASE
+                        WHEN $2 = 'failed'
+                         AND comparison_jobs.status NOT IN (
+                            'completed', 'cancelled', 'deleted'
+                         )
+                        THEN COALESCE(failed_at, NOW())
+                        ELSE failed_at
+                    END,
                     comparison_claimed = CASE
                         WHEN $4 THEN FALSE
                         ELSE comparison_claimed
                     END,
+                    lease_owner = CASE
+                        WHEN $4 THEN NULL
+                        ELSE lease_owner
+                    END,
+                    lease_token = CASE
+                        WHEN $4 THEN NULL
+                        ELSE lease_token
+                    END,
+                    state_version = state_version + 1,
                     updated_at = NOW()
                 WHERE job_id = $1
                 """,

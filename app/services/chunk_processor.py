@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 from app.models.schemas import (
@@ -18,6 +17,10 @@ from app.services.prompt_builder import (
 from app.services.state_manager import StateManager
 
 logger = logging.getLogger(__name__)
+
+TERMINAL_JOB_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "deleting", "deleted"}
+)
 
 
 class EmptyOcrError(RuntimeError):
@@ -39,16 +42,24 @@ class ChunkProcessor:
         self._comparator = comparator
         self._publish_status = publish_status
 
-    async def process(self, message: RawChunkMessage) -> None:
+    async def process(self, message: RawChunkMessage) -> bool:
         await self._state.register_chunk(message)
         db_job = await self._store.get_job(message.job_id)
-        if db_job is not None and db_job["status"] == "completed":
+        if db_job is not None and db_job["status"] in TERMINAL_JOB_STATUSES:
             logger.info(
-                "[OCR] skip completed job=%s chunk=%s",
+                "[OCR] skip terminal job=%s status=%s chunk=%s",
+                message.job_id,
+                db_job["status"],
+                message.chunk_index,
+            )
+            return False
+        if db_job is not None and db_job.get("cancel_requested_at") is not None:
+            logger.info(
+                "[OCR] skip cancel-requested job=%s chunk=%s",
                 message.job_id,
                 message.chunk_index,
             )
-            return
+            return False
 
         already_stored = await self._store.chunk_is_stored(
             message.job_id,
@@ -87,14 +98,8 @@ class ChunkProcessor:
                     )
                 )
 
-            if self._needs_ocr(message.file1) and self._needs_ocr(message.file2):
-                file1, file2 = await asyncio.gather(
-                    self._to_text(message.file1, message),
-                    self._to_text(message.file2, message),
-                )
-            else:
-                file1 = await self._to_text(message.file1, message)
-                file2 = await self._to_text(message.file2, message)
+            file1 = await self._to_text(message.file1, message)
+            file2 = await self._to_text(message.file2, message)
 
             stored_chunks, ready = await self._store.save_ocr_pair(
                 message,
@@ -121,7 +126,7 @@ class ChunkProcessor:
         )
 
         if not ready:
-            return
+            return False
 
         if progress is not None:
             await self._state.set_status(
@@ -129,7 +134,7 @@ class ChunkProcessor:
                 status="ocr_ready",
                 message="Сканирование завершено, начинается сравнение",
             )
-        await self._comparator.compare_if_ready(message.job_id)
+        return True
 
     async def _to_text(
         self,
@@ -215,6 +220,16 @@ class ChunkProcessor:
             f"Не удалось обработать страницу {chunk_index}. "
             "Попробуйте загрузить документы ещё раз."
         )
+
+        db_job = await self._store.get_job(job_id)
+        if db_job is not None and db_job["status"] in TERMINAL_JOB_STATUSES:
+            logger.warning(
+                "[PROCESS] ignore error for terminal job=%s status=%s: %s",
+                job_id,
+                db_job["status"],
+                error,
+            )
+            return
 
         await self._state.mark_failed(job_id, user_error)
         await self._store.mark_failed(job_id, user_error)

@@ -150,7 +150,7 @@ class DocumentComparator:
                 "verdict": verdict,
                 "differences": differences,
             }
-            await self._store.save_comparison_result(
+            await self._store.finalize_comparison(
                 run_id,
                 job_id=job_id,
                 comparison=comparison,
@@ -177,32 +177,42 @@ class DocumentComparator:
                 verdict,
             )
 
-            # The aggregator receives one full-document result and finalizes it
-            # immediately; raw Kafka chunks are now OCR ingestion units only.
-            await self._publish_result(
-                ProcessedResultMessage(
-                    job_id=job_id,
-                    document_id=documents.document_id,
-                    chunk_index=1,
-                    total_chunks=1,
-                    ollama={
-                        "stage": "hybrid_difference_classification",
-                        "run_id": run_id,
-                        **classification_summary,
-                    },
-                    comparison_fragment=comparison,
-                )
-            )
-            await self._store.mark_comparison_completed(job_id)
             await self._state.set_status(
                 job_id,
                 status="completed",
                 message="Сравнение завершено",
             )
+            try:
+                await self._publish_result(
+                    ProcessedResultMessage(
+                        job_id=job_id,
+                        document_id=documents.document_id,
+                        chunk_index=1,
+                        total_chunks=1,
+                        ollama={
+                            "stage": "hybrid_difference_classification",
+                            "run_id": run_id,
+                            **classification_summary,
+                        },
+                        comparison_fragment=comparison,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "[DIFF] Kafka publish failed after result save job=%s; "
+                    "job stays completed for REST/outbox",
+                    job_id,
+                )
             return True
         except Exception as exc:
             logger.exception("[DIFF] comparison failed job=%s", job_id)
-            if run_id is not None and not result_saved:
+            if result_saved:
+                logger.error(
+                    "[DIFF] keeping completed result job=%s despite later error",
+                    job_id,
+                )
+                return True
+            if run_id is not None:
                 await self._store.mark_comparison_run_failed(run_id, str(exc))
             error = "Не удалось сравнить документы. Попробуйте ещё раз."
             await self._store.mark_failed(job_id, error)

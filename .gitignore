@@ -11,3 +11,7 @@ build/
 .idea/
 .vscode/
 *.log
+
+# Runtime object store if created inside this repo.
+# Workspace copies live in ../data (outside this git root).
+/data/

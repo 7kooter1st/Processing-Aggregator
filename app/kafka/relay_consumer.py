@@ -1,13 +1,10 @@
-import asyncio
-import json
 import logging
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
-from aiokafka import AIOKafkaConsumer
 from pydantic import ValidationError
 
 from app.config import settings
-from app.logging_utils import summarize_for_log
+from app.kafka.manual_consumer import ManualCommitConsumer
 from app.models.schemas import ProcessedResultMessage, StatusUpdateMessage
 from app.services.result_aggregator import ResultAggregator
 from app.services.websocket_hub import WebSocketHub
@@ -15,98 +12,17 @@ from app.services.websocket_hub import WebSocketHub
 logger = logging.getLogger(__name__)
 
 
-class KafkaTopicConsumer:
-    def __init__(
-        self,
-        topic: str,
-        group_id: str,
-        handler: Callable[[dict[str, Any]], Awaitable[None]],
-        name: str,
-        *,
-        auto_offset_reset: str = "earliest",
-    ) -> None:
-        self._topic = topic
-        self._group_id = group_id
-        self._handler = handler
-        self._name = name
-        self._auto_offset_reset = auto_offset_reset
-        self._consumer: AIOKafkaConsumer | None = None
-        self._task: asyncio.Task | None = None
-        self._running = False
-
-    @property
-    def is_connected(self) -> bool:
-        return self._consumer is not None and self._running
-
-    async def start(self) -> None:
-        self._consumer = AIOKafkaConsumer(
-            self._topic,
-            bootstrap_servers=settings.kafka_bootstrap_servers,
-            group_id=self._group_id,
-            value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-            auto_offset_reset=self._auto_offset_reset,
-            enable_auto_commit=True,
-        )
-        await self._consumer.start()
-        self._running = True
-        self._task = asyncio.create_task(self._consume_loop())
-        logger.info(
-            "%s subscribed to %s (group=%s)",
-            self._name,
-            self._topic,
-            self._group_id,
-        )
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        if self._consumer:
-            await self._consumer.stop()
-            self._consumer = None
-
-    async def _consume_loop(self) -> None:
-        assert self._consumer is not None
-
-        try:
-            async for record in self._consumer:
-                if not self._running:
-                    break
-                logger.info(
-                    "[KAFKA IN] %s topic=%s partition=%s offset=%s key=%s payload=%s",
-                    self._name,
-                    record.topic,
-                    record.partition,
-                    record.offset,
-                    record.key.decode() if record.key else None,
-                    summarize_for_log(record.value),
-                )
-                try:
-                    await self._handler(record.value)
-                except Exception:
-                    logger.exception("%s failed to handle message", self._name)
-        except asyncio.CancelledError:
-            logger.info("%s consumer loop cancelled", self._name)
-        except Exception:
-            logger.exception("%s consumer loop failed", self._name)
-            self._running = False
-
-
 class AggregatorConsumers:
     """Kafka relay: processed_results → aggregator, status_updates → WebSocket."""
 
     def __init__(self, aggregator: ResultAggregator, ws_hub: WebSocketHub) -> None:
-        self._processed_consumer = KafkaTopicConsumer(
+        self._processed_consumer = ManualCommitConsumer(
             topic=settings.kafka_topic_processed_results,
             group_id=settings.kafka_consumer_group_aggregator,
             handler=self._handle_processed_result,
             name="Aggregator",
         )
-        self._status_consumer = KafkaTopicConsumer(
+        self._status_consumer = ManualCommitConsumer(
             topic=settings.kafka_topic_status_updates,
             group_id=f"{settings.kafka_consumer_group_aggregator}-status",
             handler=self._handle_status_update,

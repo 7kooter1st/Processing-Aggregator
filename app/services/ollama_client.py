@@ -21,6 +21,7 @@ class OllamaClient:
         self._think = settings.ollama_think
         self._retries = settings.ollama_retries
         self._retry_delay_seconds = settings.ollama_retry_delay_seconds
+        self._gpu_slots = asyncio.Semaphore(max(1, settings.ollama_max_concurrent))
 
     async def is_available(self) -> bool:
         try:
@@ -115,9 +116,18 @@ class OllamaClient:
             response_format,
         )
 
-        last_error: Exception | None = None
         attempts = max(1, self._retries + 1)
+        async with self._gpu_slots:
+            return await self._chat_locked(payload, phase=phase, attempts=attempts)
 
+    async def _chat_locked(
+        self,
+        payload: dict[str, Any],
+        *,
+        phase: str,
+        attempts: int,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
